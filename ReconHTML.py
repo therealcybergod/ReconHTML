@@ -1,125 +1,79 @@
-#!/usr/bin/env python3
-"""
-ReconHTML - An HTML scanner that checks websites for leaked sensitive data.
-Created by George Ragsdale, 2025.
-"""
-
+import re
 import requests
 from bs4 import BeautifulSoup
-import re
+from colorama import init, Fore, Style
+
+init(autoreset=True)
 
 def fetch_html(url):
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
-        print("[+] Successfully fetched HTML content.")
         return response.text
-    except Exception as e:
-        print(f"[!] Error fetching URL: {e}")
-        return ""
+    except requests.RequestException as e:
+        print(Fore.RED + f"[!] Error fetching URL: {e}")
+        return None
 
-def run_checks(html):
-    soup = BeautifulSoup(html, 'html.parser')
+def scan_html(html):
+    # Expanded regex patterns to catch many common password/key leaks
+    patterns = {
+        "Password": re.compile(r'(pass(word)?|pwd|secret|api[_-]?key|token|auth[_-]?key|credential|access[_-]?key|private[_-]?key|login|user(pass)?)[\'"\s:=]*([^\s\'"<>]+)', re.I),
+        "Email": re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'),
+        "AWS Access Key": re.compile(r'AKIA[0-9A-Z]{16}'),
+        "AWS Secret Key": re.compile(r'(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'),
+        "Private Key": re.compile(r'-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'),
+        "JWT Token": re.compile(r'eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+'),
+        "URL with credentials": re.compile(r'https?://[^/]+:[^@]+@[^/]+'),
+        "Credit Card": re.compile(r'\b(?:\d[ -]*?){13,16}\b'),
+        "IP Address": re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'),
+    }
+
     findings = []
 
-    # Helper to run a check safely
-    def safe_check(func, label):
+    for key, pattern in patterns.items():
         try:
-            results = func(soup)
-            if results:
-                findings.extend(results)
-        except Exception as e:
-            print(f"[!] Error in {label}: {e}")
-
-    # List of checks to perform
-    checks = [
-        (check_sensitive_inputs, "Sensitive Inputs"),
-        (check_comments_for_leaks, "Comment Leaks"),
-        (check_inline_js_for_leaks, "Inline JS"),
-        (check_meta_tags_for_info, "Meta Tags"),
-        (check_text_for_keywords, "Visible Keywords"),
-    ]
-
-    for func, label in checks:
-        safe_check(func, label)
+            matches = pattern.findall(html)
+            if matches:
+                # Flatten matches for patterns that return tuples
+                flat_matches = []
+                for m in matches:
+                    if isinstance(m, tuple):
+                        flat_matches.append(m[-1])
+                    else:
+                        flat_matches.append(m)
+                # Remove duplicates
+                unique_matches = list(set(flat_matches))
+                findings.append((key, unique_matches))
+        except re.error as e:
+            print(Fore.YELLOW + f"[!] Regex error for {key}: {e}")
+            continue
 
     return findings
 
-# 1. Input fields with suspicious names
-def check_sensitive_inputs(soup):
-    keywords = r"(pass(word)?|pwd|token|secret|key|api[_-]?key|auth|session|credential)"
-    results = []
-    for input_tag in soup.find_all("input"):
-        name = input_tag.get("name", "")
-        id_ = input_tag.get("id", "")
-        if re.search(keywords, name, re.I) or re.search(keywords, id_, re.I):
-            results.append(f"Sensitive-looking input field: name='{name}' id='{id_}'")
-    return results
-
-# 2. Comments with sensitive data
-def check_comments_for_leaks(soup):
-    keywords = r"(password|secret|key|token|TODO|FIXME|debug|admin|auth)"
-    results = []
-    for comment in soup.find_all(string=lambda text: isinstance(text, str) and "<!--" in text):
-        if re.search(keywords, comment, re.I):
-            results.append(f"Suspicious comment: {comment.strip()[:100]}")
-    return results
-
-# 3. Inline JavaScript leaks
-def check_inline_js_for_leaks(soup):
-    keywords = r"(var|let|const)?\s*(password|pass|secret|token|apikey|session|auth)[\s:=]+[\"']?.+?[\"']?"
-    results = []
-    for script in soup.find_all("script"):
-        if script.string:
-            lines = script.string.split("\n")
-            for line in lines:
-                if re.search(keywords, line, re.I):
-                    results.append(f"Suspicious inline JS: {line.strip()}")
-    return results
-
-# 4. Metadata that might leak internal info
-def check_meta_tags_for_info(soup):
-    keywords = r"(generator|powered|framework|server|cms)"
-    results = []
-    for meta in soup.find_all("meta"):
-        name = meta.get("name", "")
-        content = meta.get("content", "")
-        if re.search(keywords, name, re.I) or re.search(keywords, content, re.I):
-            results.append(f"Meta tag leak: name='{name}', content='{content}'")
-    return results
-
-# 5. Text nodes that look like secrets
-def check_text_for_keywords(soup):
-    keywords = r"(password\s*[:=]\s*.+|api[_-]?key\s*[:=]\s*.+|token\s*[:=]\s*.+)"
-    results = []
-    for text in soup.stripped_strings:
-        if re.search(keywords, text, re.I):
-            results.append(f"Visible potential leak: {text}")
-    return results
-
-# === Main Execution ===
-
 def main():
-    print("\n🚨 Welcome to ReconHTML - Let's explore that website...")
-    url = input("🌐 Enter a website URL to scan: ").strip()
+    print("Welcome to ReconHTML, let's explore that website...")
 
-    if not url.startswith("http"):
-        url = "http://" + url
+    url = input("Enter the website URL (including http:// or https://): ").strip()
+    if not url.startswith('http://') and not url.startswith('https://'):
+        url = 'http://' + url
 
     html = fetch_html(url)
-    if not html:
-        print("[!] No HTML content retrieved. Exiting.")
+    if html is None:
+        print(Fore.RED + "[!] Could not fetch the website HTML. Exiting.")
         return
 
-    print("\n🔍 Scanning for sensitive content...\n")
-    findings = run_checks(html)
+    print(Fore.GREEN + f"\n[+] Scanning {url} for sensitive information...\n")
 
-    if findings:
-        print("\n🛑 Potential Issues Found:")
-        for f in findings:
-            print(f" - {f}")
+    results = scan_html(html)
+
+    if not results:
+        print(Fore.GREEN + "[+] No sensitive information found in the HTML.")
     else:
-        print("✅ No obvious sensitive information found.")
+        for category, items in results:
+            print(Fore.RED + f"[!] Found possible {category}:")
+            for item in items:
+                print(Fore.YELLOW + f"  - {item}")
+            print()
 
 if __name__ == "__main__":
     main()
