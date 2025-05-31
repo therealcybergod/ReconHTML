@@ -1,79 +1,142 @@
-import re
+#!/usr/bin/env python3
 import requests
 from bs4 import BeautifulSoup
-from colorama import init, Fore, Style
+import re
+import time
+from colorama import Fore, Style, init
 
+# Initialize colorama
 init(autoreset=True)
 
-def fetch_html(url):
-    try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        print(Fore.RED + f"[!] Error fetching URL: {e}")
-        return None
+# Default realistic browser headers
+DEFAULT_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/114.0.0.0 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": ("text/html,application/xhtml+xml,application/xml;"
+               "q=0.9,image/webp,*/*;q=0.8"),
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
-def scan_html(html):
-    # Expanded regex patterns to catch many common password/key leaks
-    patterns = {
-        "Password": re.compile(r'(pass(word)?|pwd|secret|api[_-]?key|token|auth[_-]?key|credential|access[_-]?key|private[_-]?key|login|user(pass)?)[\'"\s:=]*([^\s\'"<>]+)', re.I),
-        "Email": re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'),
-        "AWS Access Key": re.compile(r'AKIA[0-9A-Z]{16}'),
-        "AWS Secret Key": re.compile(r'(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'),
-        "Private Key": re.compile(r'-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----'),
-        "JWT Token": re.compile(r'eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+'),
-        "URL with credentials": re.compile(r'https?://[^/]+:[^@]+@[^/]+'),
-        "Credit Card": re.compile(r'\b(?:\d[ -]*?){13,16}\b'),
-        "IP Address": re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'),
-    }
+# Google-like headers with Referer and Googlebot User-Agent
+GOOGLE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/114.0.0.0 Safari/537.36"),
+    "Referer": "https://www.google.com/",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": ("text/html,application/xhtml+xml,application/xml;"
+               "q=0.9,image/webp,*/*;q=0.8"),
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
-    findings = []
-
-    for key, pattern in patterns.items():
+def fetch_html_with_retry(url, headers, max_retries=5):
+    retry_delay = 5  # seconds initial backoff delay
+    for attempt in range(1, max_retries + 1):
         try:
-            matches = pattern.findall(html)
-            if matches:
-                # Flatten matches for patterns that return tuples
-                flat_matches = []
-                for m in matches:
-                    if isinstance(m, tuple):
-                        flat_matches.append(m[-1])
-                    else:
-                        flat_matches.append(m)
-                # Remove duplicates
-                unique_matches = list(set(flat_matches))
-                findings.append((key, unique_matches))
-        except re.error as e:
-            print(Fore.YELLOW + f"[!] Regex error for {key}: {e}")
-            continue
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                return response.text
+            elif response.status_code == 429:
+                wait = response.headers.get("Retry-After")
+                if wait and wait.isdigit():
+                    wait_time = int(wait)
+                    print(f"{Fore.YELLOW}[!] Rate limited. Retrying after {wait_time} seconds... (Attempt {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    print(f"{Fore.YELLOW}[!] Rate limited. Retrying after {retry_delay} seconds... (Attempt {attempt}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+            else:
+                print(f"{Fore.RED}[!] Unexpected status code {response.status_code}. Retrying... (Attempt {attempt}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+        except requests.RequestException as e:
+            print(f"{Fore.RED}[!] Request error: {e}. Retrying in {retry_delay} seconds... (Attempt {attempt}/{max_retries})")
+            time.sleep(retry_delay)
+            retry_delay *= 2
+    print(f"{Fore.RED}[!] Max retries reached. Failed to fetch URL: {url}")
+    return None
 
+# Expanded regex patterns for sensitive data detection
+PATTERNS = {
+    "Passwords": re.compile(
+        r"(password|passwd|pass|pwd|secret|token|api[-_]?key|apikey|auth|credential|sessionid|sessid)"
+        r"\s*[:=]\s*['\"]?[^'\"\s<>]{3,}['\"]?", re.IGNORECASE),
+    "Email Addresses": re.compile(
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
+    "Private Keys": re.compile(
+        r"-----BEGIN (RSA|DSA|EC|PGP|OPENSSH|PRIVATE) KEY-----.*?-----END \1 KEY-----",
+        re.DOTALL),
+    "AWS Keys": re.compile(
+        r"AKIA[0-9A-Z]{16}"),
+    "Google API Keys": re.compile(
+        r"AIza[0-9A-Za-z-_]{35}"),
+    "IP Addresses": re.compile(
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    "Credit Card Numbers": re.compile(
+        r"\b(?:\d[ -]*?){13,16}\b"),
+    "JWT Tokens": re.compile(
+        r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+    "URL with Basic Auth": re.compile(
+        r"https?:\/\/[^\s:@]+:[^\s:@]+@[^\s]+"),
+}
+
+def scan_html_for_sensitive_data(html):
+    findings = {}
+    for name, pattern in PATTERNS.items():
+        matches = pattern.findall(html)
+        if matches:
+            findings[name] = matches
     return findings
+
+def scan_website(url):
+    print(f"\n{Fore.CYAN}Fetching {url} using default headers...")
+    html = fetch_html_with_retry(url, DEFAULT_HEADERS)
+    if html is None:
+        print(f"{Fore.YELLOW}Retrying with Google-like headers...")
+        html = fetch_html_with_retry(url, GOOGLE_HEADERS)
+        if html is None:
+            print(f"{Fore.RED}Failed to retrieve website HTML with all methods.")
+            return
+
+    print(f"\n{Fore.CYAN}Scanning for sensitive information leaks...\n")
+    findings = scan_html_for_sensitive_data(html)
+
+    if not findings:
+        print(f"{Fore.GREEN}No sensitive information detected in the HTML.")
+    else:
+        for category, matches in findings.items():
+            print(f"{Fore.RED}[!] Detected {category}:")
+            unique_matches = set(matches)
+            for m in unique_matches:
+                display_match = m if len(m) < 80 else m[:77] + "..."
+                print(f"   {Fore.YELLOW}{display_match}")
+            print()
 
 def main():
     print("Welcome to ReconHTML, let's explore that website...")
+    while True:
+        url = input("\nEnter the website URL (include http:// or https://): ").strip()
+        if not url:
+            print(f"{Fore.RED}Please enter a valid URL.")
+            continue
 
-    url = input("Enter the website URL (including http:// or https://): ").strip()
-    if not url.startswith('http://') and not url.startswith('https://'):
-        url = 'http://' + url
+        scan_website(url)
 
-    html = fetch_html(url)
-    if html is None:
-        print(Fore.RED + "[!] Could not fetch the website HTML. Exiting.")
-        return
-
-    print(Fore.GREEN + f"\n[+] Scanning {url} for sensitive information...\n")
-
-    results = scan_html(html)
-
-    if not results:
-        print(Fore.GREEN + "[+] No sensitive information found in the HTML.")
-    else:
-        for category, items in results:
-            print(Fore.RED + f"[!] Found possible {category}:")
-            for item in items:
-                print(Fore.YELLOW + f"  - {item}")
-            print()
+        again = input(f"{Fore.CYAN}Would you like to scan another website? (y/n): ").strip().lower()
+        if again != 'y':
+            print(f"{Fore.GREEN}Exiting ReconHTML. Stay safe!")
+            break
 
 if __name__ == "__main__":
     main()
