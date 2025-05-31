@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ReconHTML - A defensive HTML scanner that checks websites for leaked sensitive data.
+ReconHTML - An HTML scanner that checks websites for leaked sensitive data.
 Created by George Ragsdale, 2025.
 """
 
