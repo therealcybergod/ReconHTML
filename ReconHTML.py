@@ -1,192 +1,125 @@
+#!/usr/bin/env python3
 """
-ReconHTML - Powerful Defensive HTML & JS Sensitive Data Scanner
-Created by George Ragsdale, 2025
+ReconHTML - A defensive HTML scanner that checks websites for leaked sensitive data.
+Created by George Ragsdale, 2025.
 """
 
-import re
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-import tkinter as tk
-from tkinter import scrolledtext
-import threading
+import re
 
-# Expanded sensitive patterns for detection
-SENSITIVE_PATTERNS = {
-    "API Key": r"\b(?i)(api[_-]?key)[\"'=:\s>]{1,}[\"']?[a-zA-Z0-9_\-]{16,}[\"']?",
-    "Secret Key": r"\b(?i)(secret)[\"'=:\s>]{1,}[\"']?[a-zA-Z0-9_\-\/+=]{8,}[\"']?",
-    "Password Field": r"<input[^>]*type\s*=\s*[\"']password[\"'][^>]*>",
-    "Hardcoded Password": r"\b(?i)(password|passwd|pwd|pass)[\"'=:\s>]{1,}[\"']?[a-zA-Z0-9_\-]{4,}[\"']?",
-    "Auth Token": r"\b(?i)(auth|bearer)[\"'=:\s>]{1,}[\"']?[a-zA-Z0-9\-_\.=]{10,}[\"']?",
-    "JWT": r"eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+"
-}
+def fetch_html(url):
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        print("[+] Successfully fetched HTML content.")
+        return response.text
+    except Exception as e:
+        print(f"[!] Error fetching URL: {e}")
+        return ""
 
-def scan_content(label: str, content: str):
-    """
-    Scan a block of text for sensitive patterns.
-    Returns list of tuples: (pattern name, matches list)
-    """
+def run_checks(html):
+    soup = BeautifulSoup(html, 'html.parser')
     findings = []
-    for tag, pattern in SENSITIVE_PATTERNS.items():
+
+    # Helper to run a check safely
+    def safe_check(func, label):
         try:
-            matches = re.findall(pattern, content, re.IGNORECASE | re.MULTILINE)
-            if matches:
-                # Flatten tuples if regex groups exist
-                matches = [match if isinstance(match, str) else match[0] for match in matches]
-                findings.append((f"{label} → {tag}", list(set(matches))))
+            results = func(soup)
+            if results:
+                findings.extend(results)
         except Exception as e:
-            findings.append((f"{label} → {tag}", [f"Pattern error: {str(e)}"]))
+            print(f"[!] Error in {label}: {e}")
+
+    # List of checks to perform
+    checks = [
+        (check_sensitive_inputs, "Sensitive Inputs"),
+        (check_comments_for_leaks, "Comment Leaks"),
+        (check_inline_js_for_leaks, "Inline JS"),
+        (check_meta_tags_for_info, "Meta Tags"),
+        (check_text_for_keywords, "Visible Keywords"),
+    ]
+
+    for func, label in checks:
+        safe_check(func, label)
+
     return findings
 
-def scan_url_with_enhancements(url):
-    """
-    Load the webpage with Playwright, extract HTML, inline/external JS,
-    storage, cookies, iframes, and scan them all for sensitive data.
-    """
-    all_findings = []
+# 1. Input fields with suspicious names
+def check_sensitive_inputs(soup):
+    keywords = r"(pass(word)?|pwd|token|secret|key|api[_-]?key|auth|session|credential)"
+    results = []
+    for input_tag in soup.find_all("input"):
+        name = input_tag.get("name", "")
+        id_ = input_tag.get("id", "")
+        if re.search(keywords, name, re.I) or re.search(keywords, id_, re.I):
+            results.append(f"Sensitive-looking input field: name='{name}' id='{id_}'")
+    return results
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+# 2. Comments with sensitive data
+def check_comments_for_leaks(soup):
+    keywords = r"(password|secret|key|token|TODO|FIXME|debug|admin|auth)"
+    results = []
+    for comment in soup.find_all(string=lambda text: isinstance(text, str) and "<!--" in text):
+        if re.search(keywords, comment, re.I):
+            results.append(f"Suspicious comment: {comment.strip()[:100]}")
+    return results
 
-        try:
-            page.goto(url, timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=10000)
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
+# 3. Inline JavaScript leaks
+def check_inline_js_for_leaks(soup):
+    keywords = r"(var|let|const)?\s*(password|pass|secret|token|apikey|session|auth)[\s:=]+[\"']?.+?[\"']?"
+    results = []
+    for script in soup.find_all("script"):
+        if script.string:
+            lines = script.string.split("\n")
+            for line in lines:
+                if re.search(keywords, line, re.I):
+                    results.append(f"Suspicious inline JS: {line.strip()}")
+    return results
 
-            # Scan main HTML
-            all_findings.extend(scan_content("Main Page", html))
+# 4. Metadata that might leak internal info
+def check_meta_tags_for_info(soup):
+    keywords = r"(generator|powered|framework|server|cms)"
+    results = []
+    for meta in soup.find_all("meta"):
+        name = meta.get("name", "")
+        content = meta.get("content", "")
+        if re.search(keywords, name, re.I) or re.search(keywords, content, re.I):
+            results.append(f"Meta tag leak: name='{name}', content='{content}'")
+    return results
 
-            # Scan inline scripts
-            try:
-                scripts = soup.find_all("script", src=False)
-                for i, script in enumerate(scripts):
-                    if script.string:
-                        all_findings.extend(scan_content(f"Inline JS #{i+1}", script.string))
-            except Exception as e:
-                all_findings.append(("Inline Script Scan", [f"Error: {str(e)}"]))
+# 5. Text nodes that look like secrets
+def check_text_for_keywords(soup):
+    keywords = r"(password\s*[:=]\s*.+|api[_-]?key\s*[:=]\s*.+|token\s*[:=]\s*.+)"
+    results = []
+    for text in soup.stripped_strings:
+        if re.search(keywords, text, re.I):
+            results.append(f"Visible potential leak: {text}")
+    return results
 
-            # Scan external scripts
-            try:
-                scripts = soup.find_all("script", src=True)
-                for i, script in enumerate(scripts):
-                    src = script['src']
-                    full_url = src if src.startswith("http") else requests.compat.urljoin(url, src)
-                    try:
-                        res = requests.get(full_url, timeout=10)
-                        res.raise_for_status()
-                        all_findings.extend(scan_content(f"External JS #{i+1}", res.text))
-                    except Exception as e:
-                        all_findings.append((f"External JS #{i+1}", [f"Fetch error: {str(e)}"]))
-            except Exception as e:
-                all_findings.append(("External JS Scan", [f"Error: {str(e)}"]))
+# === Main Execution ===
 
-            # Scan localStorage
-            try:
-                local_storage = page.evaluate("() => JSON.stringify(localStorage)")
-                all_findings.extend(scan_content("localStorage", local_storage))
-            except Exception as e:
-                all_findings.append(("localStorage", [f"Error: {str(e)}"]))
+def main():
+    print("\n🚨 Welcome to ReconHTML - Let's explore that website...")
+    url = input("🌐 Enter a website URL to scan: ").strip()
 
-            # Scan sessionStorage
-            try:
-                session_storage = page.evaluate("() => JSON.stringify(sessionStorage)")
-                all_findings.extend(scan_content("sessionStorage", session_storage))
-            except Exception as e:
-                all_findings.append(("sessionStorage", [f"Error: {str(e)}"]))
+    if not url.startswith("http"):
+        url = "http://" + url
 
-            # Scan cookies
-            try:
-                cookies = page.context.cookies()
-                for cookie in cookies:
-                    all_findings.extend(scan_content("Cookie", str(cookie)))
-            except Exception as e:
-                all_findings.append(("Cookies", [f"Error: {str(e)}"]))
+    html = fetch_html(url)
+    if not html:
+        print("[!] No HTML content retrieved. Exiting.")
+        return
 
-            # Scan iframes
-            try:
-                for frame in page.frames:
-                    try:
-                        frame_html = frame.content()
-                        all_findings.extend(scan_content("Iframe", frame_html))
-                    except Exception as e:
-                        all_findings.append(("Iframe", [f"Frame content error: {str(e)}"]))
-            except Exception as e:
-                all_findings.append(("Iframes", [f"Error: {str(e)}"]))
+    print("\n🔍 Scanning for sensitive content...\n")
+    findings = run_checks(html)
 
-        except Exception as e:
-            all_findings.append(("Page Load", [f"Error: {str(e)}"]))
+    if findings:
+        print("\n🛑 Potential Issues Found:")
+        for f in findings:
+            print(f" - {f}")
+    else:
+        print("✅ No obvious sensitive information found.")
 
-        browser.close()
-
-    return all_findings
-
-def typewriter_text(widget, text, delay=100, callback=None):
-    """
-    Typewriter effect for Tkinter Label widget.
-    """
-    def inner_type(i=0):
-        if i <= len(text):
-            widget.config(text=text[:i])
-            widget.after(delay, inner_type, i+1)
-        else:
-            if callback:
-                callback()
-    inner_type()
-
-def show_intro_then_prompt():
-    """
-    Show the intro text with typewriter effect, then show URL input UI.
-    """
-    intro_label.pack(pady=10)
-    url_entry.pack_forget()
-    scan_button.pack_forget()
-    results_text.pack_forget()
-
-    def after_intro():
-        intro_label.config(text="Enter URL to Scan:")
-        url_entry.pack(side=tk.LEFT, padx=5)
-        scan_button.pack(side=tk.LEFT)
-        results_text.pack(padx=10, pady=10)
-
-    typewriter_text(intro_label, "Welcome To ReconHTML, lets explore that website...", delay=80, callback=after_intro)
-
-def run_scan():
-    """
-    Run the scan in a thread to keep GUI responsive.
-    """
-    url = url_entry.get()
-    scan_button.config(state="disabled")
-    results_text.delete(1.0, tk.END)
-    results_text.insert(tk.END, f"Scanning {url}...\n\n")
-
-    def threaded_scan():
-        findings = scan_url_with_enhancements(url)
-        for label, matches in findings:
-            results_text.insert(tk.END, f"[{label}]\n")
-            for match in matches:
-                results_text.insert(tk.END, f"  - {match}\n")
-            results_text.insert(tk.END, "\n")
-        scan_button.config(state="normal")
-
-    threading.Thread(target=threaded_scan).start()
-
-
-# --- GUI Setup ---
-
-root = tk.Tk()
-root.title("ReconHTML - Created by George Ragsdale, 2025")
-root.geometry("900x700")
-
-frame = tk.Frame(root)
-frame.pack(pady=10)
-
-intro_label = tk.Label(frame, text="", font=("Consolas", 14))
-url_entry = tk.Entry(frame, width=60)
-scan_button = tk.Button(frame, text="Scan", command=run_scan)
-results_text = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=110, height=35)
-
-show_intro_then_prompt()
-
-root.mainloop()
+if __name__ == "__main__":
+    main()
